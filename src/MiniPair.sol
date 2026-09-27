@@ -3,7 +3,6 @@ pragma solidity 0.8.26;
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
-import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 
 /// @title MiniPair: a tiny constant-product ETH / ERC-20 pool
@@ -23,7 +22,7 @@ import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 ///   reserves this makes the classic share-inflation ("first depositor") attack unprofitable.
 /// - Token pulls verify the received amount, so fee-on-transfer or rebasing tokens are rejected
 ///   rather than silently mis-accounted.
-contract MiniPair is ReentrancyGuard {
+contract MiniPair {
     using SafeERC20 for IERC20;
 
     // ---------------------------------------------------------------------------------------
@@ -80,6 +79,7 @@ contract MiniPair is ReentrancyGuard {
     // Errors
     // ---------------------------------------------------------------------------------------
 
+    error ReentrancyGuardReentrantCall();
     error ZeroAddress();
     error FeeTooHigh(uint256 feeBps, uint256 maxFeeBps);
     error ZeroAmount();
@@ -92,6 +92,23 @@ contract MiniPair is ReentrancyGuard {
     error PoolEmpty();
     error EthTransferFailed();
     error UnexpectedTokenAmount(uint256 expected, uint256 received);
+
+    /// @dev Cancun transient slot 0 is reserved for this lock (separate from persistent storage).
+    /// Clear after success so independent calls in one transaction work; reverts roll back the lock.
+    modifier nonReentrant() {
+        bool entered;
+        assembly ("memory-safe") {
+            entered := tload(0)
+        }
+        if (entered) revert ReentrancyGuardReentrantCall();
+        assembly ("memory-safe") {
+            tstore(0, 1)
+        }
+        _;
+        assembly ("memory-safe") {
+            tstore(0, 0)
+        }
+    }
 
     // ---------------------------------------------------------------------------------------
     // Constructor
@@ -137,7 +154,10 @@ contract MiniPair is ReentrancyGuard {
             tokenUsed = tokenAmount;
             uint256 initial = Math.sqrt(ethUsed * tokenUsed);
             if (initial <= MINIMUM_SHARES) revert InsufficientInitialLiquidity();
-            shares = initial - MINIMUM_SHARES;
+            // The preceding check proves initial > MINIMUM_SHARES.
+            unchecked {
+                shares = initial - MINIMUM_SHARES;
+            }
             // Permanently lock the minimum so the share price can never be inflated to absurd levels.
             sharesOf[address(0)] = MINIMUM_SHARES;
             supply = MINIMUM_SHARES;
@@ -163,11 +183,13 @@ contract MiniPair is ReentrancyGuard {
         // Effects.
         sharesOf[msg.sender] += shares;
         totalShares = supply + shares;
-        _reserveEth += ethUsed;
-        _reserveToken += tokenUsed;
+        uint256 reserveEthAfter = _reserveEth + ethUsed;
+        uint256 reserveTokenAfter = _reserveToken + tokenUsed;
+        _reserveEth = reserveEthAfter;
+        _reserveToken = reserveTokenAfter;
 
         emit LiquidityAdded(msg.sender, ethUsed, tokenUsed, shares);
-        emit Sync(_reserveEth, _reserveToken);
+        emit Sync(reserveEthAfter, reserveTokenAfter);
 
         // Interactions.
         _pullTokens(msg.sender, tokenUsed);
@@ -198,13 +220,18 @@ contract MiniPair is ReentrancyGuard {
         if (tokenOut < minToken) revert InsufficientTokenOut(tokenOut, minToken);
 
         // Effects.
-        sharesOf[msg.sender] = held - shares;
+        // The balance check above proves shares <= held.
+        unchecked {
+            sharesOf[msg.sender] = held - shares;
+        }
         totalShares = supply - shares;
-        _reserveEth -= ethOut;
-        _reserveToken -= tokenOut;
+        uint256 reserveEthAfter = _reserveEth - ethOut;
+        uint256 reserveTokenAfter = _reserveToken - tokenOut;
+        _reserveEth = reserveEthAfter;
+        _reserveToken = reserveTokenAfter;
 
         emit LiquidityRemoved(msg.sender, ethOut, tokenOut, shares);
-        emit Sync(_reserveEth, _reserveToken);
+        emit Sync(reserveEthAfter, reserveTokenAfter);
 
         // Interactions.
         token.safeTransfer(msg.sender, tokenOut);
@@ -228,11 +255,13 @@ contract MiniPair is ReentrancyGuard {
         if (amountOut == 0 || amountOut < minOut) revert InsufficientOutput(amountOut, minOut);
 
         // Effects.
-        _reserveEth = reserveEth + msg.value;
-        _reserveToken = reserveToken - amountOut;
+        reserveEth += msg.value;
+        reserveToken -= amountOut;
+        _reserveEth = reserveEth;
+        _reserveToken = reserveToken;
 
         emit Swap(msg.sender, msg.value, 0, 0, amountOut);
-        emit Sync(_reserveEth, _reserveToken);
+        emit Sync(reserveEth, reserveToken);
 
         // Interactions.
         token.safeTransfer(msg.sender, amountOut);
@@ -252,11 +281,13 @@ contract MiniPair is ReentrancyGuard {
         if (amountOut == 0 || amountOut < minOut) revert InsufficientOutput(amountOut, minOut);
 
         // Effects.
-        _reserveToken = reserveToken + amountIn;
-        _reserveEth = reserveEth - amountOut;
+        reserveToken += amountIn;
+        reserveEth -= amountOut;
+        _reserveToken = reserveToken;
+        _reserveEth = reserveEth;
 
         emit Swap(msg.sender, 0, amountIn, amountOut, 0);
-        emit Sync(_reserveEth, _reserveToken);
+        emit Sync(reserveEth, reserveToken);
 
         // Interactions.
         _pullTokens(msg.sender, amountIn);
